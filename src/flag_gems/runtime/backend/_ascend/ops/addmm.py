@@ -161,6 +161,26 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
     if mat2.stride(0) > 1 and mat2.stride(1) > 1:
         mat2 = mat2.contiguous()
 
+    # Align B row pitch when large NN GEMMs amortize the packing cost.
+    # Padding is outside the logical N and is never loaded by the masked kernel.
+    if (
+        mat1.dtype == torch.bfloat16
+        and mat1.stride(1) == 1
+        and mat2.stride(1) == 1
+        and mat2.stride(0) == N
+        and M >= 4096
+        and N >= 128
+        and K >= 512
+        and N % 256 != 0
+        and (N % 128 != 0 or K >= 4096)
+    ):
+        storage = torch.empty(
+            (K, triton.cdiv(N, 256) * 256), device=mat2.device, dtype=mat2.dtype
+        )
+        packed = storage[:, :N]
+        packed.copy_(mat2)
+        mat2 = packed
+
     # Keep vector/scalar bias compact; broadcast strides cover other valid shapes.
     bias_is_vector = bias.ndim == 1 and bias.shape[0] == N
     bias_is_scalar = not bias_is_vector and bias.numel() == 1
