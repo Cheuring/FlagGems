@@ -249,6 +249,33 @@ def test_addmm_out_beta_zero_ignores_bias(dtype):
     utils.gems_assert_close(out, ref_out, dtype, reduce_dim=K)
 
 
+@pytest.mark.addmm_out
+@pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend", reason="Ascend output-layout tuning regression"
+)
+def test_addmm_out_layout_tuning():
+    M, N, K = 4096, 129, 512
+    dtype = torch.bfloat16
+    mat1 = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
+    # Keep input strides identical while exercising two output layouts.
+    mat2 = torch.randn((K, 256), dtype=dtype, device=flag_gems.device)[:, :N]
+    bias = torch.randn((N,), dtype=dtype, device=flag_gems.device)
+    ref = torch.addmm(
+        utils.to_reference(bias, True),
+        utils.to_reference(mat1, True),
+        utils.to_reference(mat2, True),
+    )
+    for column_stride in (1, 2):
+        storage = torch.empty(
+            (M, N * column_stride), dtype=dtype, device=flag_gems.device
+        )
+        out = storage[:, ::column_stride]
+        result = flag_gems.addmm_out(bias, mat1, mat2, out=out)
+        assert result.data_ptr() == out.data_ptr()
+        assert result.stride() == out.stride()
+        utils.gems_assert_close(result, ref, dtype, reduce_dim=K)
+
+
 @pytest.mark.addmm_out_vector_bias
 @pytest.mark.addmm_out
 @_addmm_layout_bias_only
