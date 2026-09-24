@@ -17,6 +17,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as extension
 
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
@@ -36,6 +37,7 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         args["A"].dtype != torch.bfloat16
         or args["stride_ak"] != 1
         or args["stride_bn"] != 1
+        or args["stride_cn"] != 1
         or min(args["M"], args["N"]) < 128
     ):
         return _ADDMM_BASE_CONFIGS
@@ -63,7 +65,17 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         )
         for m, n, k in ((128, 256, 64), (128, 256, 256), (256, 128, 128))
     ],
-    key=["M", "N", "K", "stride_am", "stride_ak", "stride_bk", "stride_bn"],
+    key=[
+        "M",
+        "N",
+        "K",
+        "stride_am",
+        "stride_ak",
+        "stride_bk",
+        "stride_bn",
+        "stride_cm",
+        "stride_cn",
+    ],
     prune_configs_by={"early_config_prune": _prune_addmm_configs},
 )
 @triton.heuristics(_hcu.HEURISTICS_CONFIGS["mm"])
@@ -95,6 +107,7 @@ def addmm_kernel(
     EVEN_K: tl.constexpr,
     BIAS_IS_VECTOR: tl.constexpr,
     BIAS_IS_SCALAR: tl.constexpr,
+    DOT_PAD_ONLY_K: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     pid_z = tl.program_id(1)
@@ -130,6 +143,9 @@ def addmm_kernel(
                 mask=(rk < k_remaining)[:, None] & (rbn < N)[None, :],
                 other=0.0,
             )
+        if DOT_PAD_ONLY_K:
+            extension.compile_hint(a, "dot_pad_only_k")
+            extension.compile_hint(b, "dot_pad_only_k")
         acc += tl.dot(a, b, out_dtype=dot_out_dtype, allow_tf32=False)
         A += BLOCK_K * SPLIT_K * stride_ak
         B += BLOCK_K * SPLIT_K * stride_bk
@@ -168,6 +184,7 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
         and mat1.stride(1) == 1
         and mat2.stride(1) == 1
         and mat2.stride(0) == N
+        and out.stride(1) == 1
         and M >= 4096
         and N >= 128
         and K >= 512
@@ -222,6 +239,17 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
             GROUP_M=8,
             BIAS_IS_VECTOR=bias_is_vector,
             BIAS_IS_SCALAR=bias_is_scalar,
+            DOT_PAD_ONLY_K=(
+                mat1.dtype == torch.bfloat16
+                and mat1.stride(1) == 1
+                and mat2.stride(1) == 1
+                and out.stride(1) == 1
+                and M >= 4096
+                and N >= 128
+                and M % 128 == 0
+                and N % 128 == 0
+                and 0 < K <= 1024
+            ),
         )
     return out
 
