@@ -26,10 +26,45 @@ from flag_gems.utils import broadcastable_to, libentry, libtuner
 logger = logging.getLogger(__name__)
 
 
+# Preserve the existing candidates for other dtypes, layouts, and small GEMMs.
+_ADDMM_BASE_CONFIGS = runtime.get_tuned_config("mm")
+
+
+def _prune_addmm_configs(configs, named_args, **kwargs):
+    args = {**named_args, **kwargs}
+    if (
+        args["A"].dtype != torch.bfloat16
+        or args["stride_ak"] != 1
+        or args["stride_bn"] != 1
+        or min(args["M"], args["N"]) < 128
+    ):
+        return _ADDMM_BASE_CONFIGS
+    # Large K tiles amortize loop overhead; short reductions need less padding.
+    tiles = (
+        {(128, 128, 128), (128, 256, 64)}
+        if args["K"] <= 256
+        else {(128, 128, 128), (128, 256, 256), (256, 128, 128)}
+    )
+    return [
+        config
+        for config in configs
+        if tuple(config.kwargs[k] for k in ("BLOCK_M", "BLOCK_N", "BLOCK_K")) in tiles
+    ]
+
+
 @libentry()
 @libtuner(
-    configs=runtime.get_tuned_config("mm"),
-    key=["M", "N", "K"],
+    configs=_ADDMM_BASE_CONFIGS
+    + [
+        triton.Config(
+            {"BLOCK_M": m, "BLOCK_N": n, "BLOCK_K": k, "SPLIT_K": 1},
+            num_warps=4,
+            num_stages=2,
+        )
+        for m, n, k in ((128, 256, 64), (128, 256, 256), (256, 128, 128))
+    ],
+    key=["M", "N", "K", "stride_am", "stride_ak", "stride_bk", "stride_bn"],
+    prune_configs_by={"early_config_prune": _prune_addmm_configs},
 )
 @triton.heuristics(_hcu.HEURISTICS_CONFIGS["mm"])
 @triton.jit(do_not_specialize=["alpha", "beta"])
