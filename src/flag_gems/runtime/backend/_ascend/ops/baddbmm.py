@@ -30,6 +30,25 @@ from .bmm import bmm
 logger = logging.getLogger(__name__)
 
 
+def _broadcast_strides(tensor, shape):
+    """Return strides for a broadcast view without materializing the output."""
+    if tensor.ndim > len(shape):
+        raise RuntimeError("bias cannot be broadcast to the baddbmm output shape")
+    padded_shape = (1,) * (len(shape) - tensor.ndim) + tuple(tensor.shape)
+    padded_strides = (0,) * (len(shape) - tensor.ndim) + tensor.stride()
+    strides = []
+    for source_size, source_stride, target_size in zip(
+        padded_shape, padded_strides, shape
+    ):
+        if source_size == target_size:
+            strides.append(source_stride)
+        elif source_size == 1:
+            strides.append(0)
+        else:
+            raise RuntimeError("bias cannot be broadcast to the baddbmm output shape")
+    return tuple(strides)
+
+
 @libentry()
 @libtuner(
     configs=runtime.get_tuned_config("baddbmm"),
@@ -160,10 +179,9 @@ class BaddbmmFunction(torch.autograd.Function):
         B = B.contiguous()
         out = torch.empty((batch, M, N), dtype=A.dtype, device=A.device)
 
-        bbias = torch.broadcast_to(bias, (batch, M, N)).contiguous()
-        bias_batch_stride = bbias.stride(0)
-        bias_M_stride = bbias.stride(1)
-        bias_N_stride = bbias.stride(-1)
+        bias_batch_stride, bias_M_stride, bias_N_stride = _broadcast_strides(
+            bias, (batch, M, N)
+        )
 
         grid = lambda meta: (
             triton.cdiv(meta["M"], meta["TILE_M"]),
@@ -175,7 +193,7 @@ class BaddbmmFunction(torch.autograd.Function):
                 A,
                 B,
                 out,
-                bbias,
+                bias,
                 alpha,
                 beta,
                 M,
