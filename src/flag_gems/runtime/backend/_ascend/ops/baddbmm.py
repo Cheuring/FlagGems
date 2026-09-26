@@ -205,9 +205,7 @@ def baddbmm_kernel(
             bi = tl.load(bias_ptrs, mask=offs_n < N, other=0.0)[None, :]
     else:
         bias_ptrs = (
-            bias
-            + offs_m[:, None] * bias_M_stride
-            + offs_n[None, :] * bias_N_stride
+            bias + offs_m[:, None] * bias_M_stride + offs_n[None, :] * bias_N_stride
         )
         bi = tl.load(bias_ptrs, mask=mask_c)
     out = accumulator * alpha + bi * beta
