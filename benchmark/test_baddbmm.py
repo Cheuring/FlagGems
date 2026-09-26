@@ -19,7 +19,6 @@ import flag_gems
 
 from . import base, consts
 
-
 ASCEND_VECTOR_BIAS_SHAPES = [
     (1, 448, 7168, 256),
     (1, 14429, 2112, 7168),
