@@ -132,14 +132,10 @@ def bmm_kernel(
         else:
             mask_k = offs_k < K - i * TILE_K
             mask_a = (
-                mask_k[None, :]
-                if DIVISIBLE_M
-                else mask_m[:, None] & mask_k[None, :]
+                mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
             )
             mask_b = (
-                mask_k[:, None]
-                if DIVISIBLE_N
-                else mask_k[:, None] & mask_n[None, :]
+                mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
             )
         if DIVISIBLE_K and DIVISIBLE_M:
             a = tl.load(a_ptrs)
