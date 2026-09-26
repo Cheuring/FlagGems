@@ -64,6 +64,16 @@ _addmm_beta_zero_only = pytest.mark.skipif(
     reason="Issue #5755: this backend does not yet preserve the AddMM beta-zero contract",
 )
 
+_addmm_ascend_only = pytest.mark.skipif(
+    flag_gems.vendor_name != "ascend",
+    reason="Ascend-specific addmm target-shape coverage",
+)
+ASCEND_TARGET_MNK_SHAPES = [
+    (65536, 1152, 144),
+    (65536, 538, 1152),
+    (16384, 2048, 4608),
+]
+
 
 @pytest.mark.addmm
 @pytest.mark.parametrize("M, N, K", MNK_SHAPES)
@@ -343,6 +353,26 @@ def test_addmm_broadcast_bias(dtype, bias_shape):
     out = flag_gems.addmm(bias, mat1, mat2)
 
     utils.gems_assert_close(out, ref_out, dtype, reduce_dim=K)
+
+
+@pytest.mark.addmm_vector_bias
+@pytest.mark.addmm
+@_addmm_ascend_only
+@pytest.mark.parametrize("M, N, K", ASCEND_TARGET_MNK_SHAPES)
+def test_addmm_ascend_target_shapes(M, N, K):
+    dtype = torch.bfloat16
+    mat1 = torch.randn((M, K), dtype=dtype, device=flag_gems.device)
+    mat2 = torch.randn((K, N), dtype=dtype, device=flag_gems.device)
+    bias = torch.randn((N,), dtype=dtype, device=flag_gems.device)
+
+    ref_out = torch.addmm(
+        utils.to_reference(bias, True),
+        utils.to_reference(mat1, True),
+        utils.to_reference(mat2, True),
+    )
+    result = flag_gems.addmm(bias, mat1, mat2)
+
+    utils.gems_assert_close(result, ref_out, dtype, reduce_dim=K)
 
 
 @pytest.mark.addmm_dtype
