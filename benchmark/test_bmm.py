@@ -21,7 +21,6 @@ from flag_gems.ops.bmm_w8a8_fp8 import bmm_w8a8_fp8
 
 from . import base, consts
 
-
 ASCEND_TARGET_SHAPES = [
     (1, 448, 7168, 256),
     (1, 14429, 2112, 7168),
