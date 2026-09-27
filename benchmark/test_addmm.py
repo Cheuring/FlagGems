@@ -19,12 +19,6 @@ import flag_gems
 
 from . import base, consts, utils
 
-ASCEND_VECTOR_BIAS_SHAPES = [
-    (1, 65536, 1152, 144),
-    (1, 65536, 538, 1152),
-    (1, 16384, 2048, 4608),
-]
-
 
 def _input_fn(b, m, n, k, dtype, device, b_column_major):
     inp1 = torch.randn([m, k], dtype=dtype, device=device)
@@ -39,8 +33,6 @@ def _input_fn(b, m, n, k, dtype, device, b_column_major):
 
 class AddmmVectorBiasBenchmark(base.BlasBenchmark):
     def set_more_shapes(self):
-        if flag_gems.vendor_name == "ascend":
-            return ASCEND_VECTOR_BIAS_SHAPES
         return []
 
     def get_input_iter(self, dtype):
