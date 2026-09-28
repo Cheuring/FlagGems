@@ -46,6 +46,17 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
         or min(args["M"], args["N"]) < 128
     ):
         return _ADDMM_BASE_CONFIGS
+    if args["M"] == args["N"] == args["K"]:
+        if args["A"].dtype == torch.float32:
+            tile = (64, 128, 128) if args["M"] < 512 else (256, 128, 128)
+        else:
+            tile = (128, 128, 128) if args["M"] < 512 else (128, 256, 256)
+        return [
+            config
+            for config in configs
+            if tuple(config.kwargs[key] for key in ("BLOCK_M", "BLOCK_N", "BLOCK_K"))
+            == tile
+        ]
     # Large K tiles amortize loop overhead; short reductions need less padding.
     tiles = (
         {(128, 128, 128), (128, 256, 64)}
@@ -68,7 +79,12 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
             num_warps=4,
             num_stages=2,
         )
-        for m, n, k in ((128, 256, 64), (128, 256, 256), (256, 128, 128))
+        for m, n, k in (
+            (64, 128, 128),
+            (128, 256, 64),
+            (128, 256, 256),
+            (256, 128, 128),
+        )
     ],
     key=[
         "M",
@@ -131,6 +147,12 @@ def addmm_kernel(
     ram = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rbn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+    if DIVISIBLE_M:
+        ram = tl.max_contiguous(tl.multiple_of(ram, BLOCK_M), BLOCK_M)
+    if DIVISIBLE_N:
+        rbn = tl.max_contiguous(tl.multiple_of(rbn, BLOCK_N), BLOCK_N)
+    if EVEN_K:
+        rk = tl.max_contiguous(tl.multiple_of(rk, BLOCK_K), BLOCK_K)
     A += ram[:, None] * stride_am + rk[None, :] * stride_ak
     B += rk[:, None] * stride_bk + rbn[None, :] * stride_bn
     if not DIVISIBLE_M:
