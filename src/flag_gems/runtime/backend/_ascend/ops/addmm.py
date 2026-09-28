@@ -29,12 +29,17 @@ logger = logging.getLogger(__name__)
 
 # Preserve the existing candidates for other dtypes, layouts, and small GEMMs.
 _ADDMM_BASE_CONFIGS = runtime.get_tuned_config("mm")
+_ADDMM_HEURISTICS = {
+    **_hcu.HEURISTICS_CONFIGS["mm"],
+    "DIVISIBLE_M": lambda args: args["M"] % args["BLOCK_M"] == 0,
+    "DIVISIBLE_N": lambda args: args["N"] % args["BLOCK_N"] == 0,
+}
 
 
 def _prune_addmm_configs(configs, named_args, **kwargs):
     args = {**named_args, **kwargs}
     if (
-        args["A"].dtype != torch.bfloat16
+        args["A"].dtype not in (torch.float16, torch.float32, torch.bfloat16)
         or args["stride_ak"] != 1
         or args["stride_bn"] != 1
         or args["stride_cn"] != 1
@@ -79,7 +84,7 @@ def _prune_addmm_configs(configs, named_args, **kwargs):
     ],
     prune_configs_by={"early_config_prune": _prune_addmm_configs},
 )
-@triton.heuristics(_hcu.HEURISTICS_CONFIGS["mm"])
+@triton.heuristics(_ADDMM_HEURISTICS)
 @triton.jit(do_not_specialize=["alpha", "beta"])
 def addmm_kernel(
     A,
@@ -106,6 +111,8 @@ def addmm_kernel(
     GROUP_M: tl.constexpr,
     SPLIT_K: tl.constexpr,
     EVEN_K: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
     BIAS_IS_VECTOR: tl.constexpr,
     BIAS_IS_SCALAR: tl.constexpr,
     DOT_PAD_ONLY_K: tl.constexpr = False,
@@ -126,22 +133,41 @@ def addmm_kernel(
     rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
     A += ram[:, None] * stride_am + rk[None, :] * stride_ak
     B += rk[:, None] * stride_bk + rbn[None, :] * stride_bn
+    if not DIVISIBLE_M:
+        mask_m = ram < M
+    if not DIVISIBLE_N:
+        mask_n = rbn < N
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=dot_out_dtype)
     for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
         if EVEN_K:
-            a = tl.load(A, mask=(ram < M)[:, None], other=0.0)
-            b = tl.load(B, mask=(rbn < N)[None, :], other=0.0)
+            if DIVISIBLE_M:
+                a = tl.load(A)
+            else:
+                a = tl.load(A, mask=mask_m[:, None], other=0.0)
+            if DIVISIBLE_N:
+                b = tl.load(B)
+            else:
+                b = tl.load(B, mask=mask_n[None, :], other=0.0)
         else:
             k_remaining = K - k * (BLOCK_K * SPLIT_K)
+            mask_k = rk < k_remaining
             a = tl.load(
                 A,
-                mask=(ram < M)[:, None] & (rk < k_remaining)[None, :],
+                mask=(
+                    mask_k[None, :]
+                    if DIVISIBLE_M
+                    else mask_m[:, None] & mask_k[None, :]
+                ),
                 other=0.0,
             )
             b = tl.load(
                 B,
-                mask=(rk < k_remaining)[:, None] & (rbn < N)[None, :],
+                mask=(
+                    mask_k[:, None]
+                    if DIVISIBLE_N
+                    else mask_k[:, None] & mask_n[None, :]
+                ),
                 other=0.0,
             )
         if DOT_PAD_ONLY_K:
@@ -152,21 +178,37 @@ def addmm_kernel(
         B += BLOCK_K * SPLIT_K * stride_bk
 
     C += ram[:, None] * stride_cm + rbn[None, :] * stride_cn
-    mask = (ram < M)[:, None] & (rbn < N)[None, :]
+    if DIVISIBLE_M and DIVISIBLE_N:
+        mask = None
+    elif DIVISIBLE_M:
+        mask = mask_n[None, :]
+    elif DIVISIBLE_N:
+        mask = mask_m[:, None]
+    else:
+        mask = mask_m[:, None] & mask_n[None, :]
     if BIAS_IS_VECTOR:
         # Load a 1-D bias once per output-column tile.
-        bias_tile = tl.load(
-            bias + stride_in * rbn,
-            mask=rbn < N,
-            other=0.0,
-        )[None, :]
+        if DIVISIBLE_N:
+            bias_tile = tl.load(bias + stride_in * rbn)[None, :]
+        else:
+            bias_tile = tl.load(
+                bias + stride_in * rbn,
+                mask=mask_n,
+                other=0.0,
+            )[None, :]
     elif BIAS_IS_SCALAR:
         bias_tile = tl.load(bias)
     else:
         bias += stride_im * ram[:, None] + stride_in * rbn[None, :]
-        bias_tile = tl.load(bias, mask=mask, other=0.0)
+        if DIVISIBLE_M and DIVISIBLE_N:
+            bias_tile = tl.load(bias)
+        else:
+            bias_tile = tl.load(bias, mask=mask, other=0.0)
     acc = acc * alpha + bias_tile.to(acc.dtype) * beta
-    tl.store(C, acc.to(C.dtype.element_ty), mask=mask)
+    if DIVISIBLE_M and DIVISIBLE_N:
+        tl.store(C, acc.to(C.dtype.element_ty))
+    else:
+        tl.store(C, acc.to(C.dtype.element_ty), mask=mask)
 
 
 def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
@@ -241,12 +283,11 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
             BIAS_IS_VECTOR=bias_is_vector,
             BIAS_IS_SCALAR=bias_is_scalar,
             DOT_PAD_ONLY_K=(
-                mat1.dtype == torch.bfloat16
+                mat1.dtype in (torch.float16, torch.bfloat16)
                 and mat1.stride(1) == 1
                 and mat2.stride(1) == 1
                 and out.stride(1) == 1
-                and bias_is_vector
-                and M >= 4096
+                and M >= 128
                 and N >= 128
                 and N % 16 == 0
                 and K > 0
