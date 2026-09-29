@@ -233,6 +233,54 @@ def addmm_kernel(
         tl.store(C, acc.to(C.dtype.element_ty), mask=mask)
 
 
+@libentry()
+@triton.jit
+def _addmm_small_mm(A, B, P, N: tl.constexpr, BM: tl.constexpr):
+    # Keep the matrix product separate from the Vector bias epilogue.
+    BN: tl.constexpr = 128
+    BK: tl.constexpr = 128
+    pid = tl.program_id(0)
+    row = pid // tl.cdiv(N, BN) * BM + tl.arange(0, BM)
+    col = pid % tl.cdiv(N, BN) * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    ap = A + row[:, None] * N + kk[None, :]
+    bp = B + kk[:, None] * N + col[None, :]
+    acc = tl.zeros((BM, BN), tl.float32)
+    for _ in range(N // BK):
+        a = tl.load(ap, row[:, None] < N, other=0)
+        b = tl.load(bp, col[None, :] < N, other=0)
+        acc += tl.dot(a, b, allow_tf32=False)
+        ap += BK
+        bp += BK * N
+    tl.store(
+        P + row[:, None] * N + col[None, :],
+        acc,
+        (row[:, None] < N) & (col[None, :] < N),
+    )
+
+
+@libentry()
+@triton.jit
+def _addmm_small_add(P, Bias, C, N: tl.constexpr):
+    idx = tl.program_id(0) * 8192 + tl.arange(0, 8192)
+    value = tl.load(P + idx, idx < N * N, other=0)
+    bias = tl.load(Bias + idx, idx < N * N, other=0).to(tl.float32)
+    tl.store(C + idx, value + bias, idx < N * N)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["alpha", "beta"])
+def _addmm_small_finish(P, Bias, C, alpha, beta, N: tl.constexpr, UNIT: tl.constexpr):
+    idx = tl.program_id(0) * 8192 + tl.arange(0, 8192)
+    value = tl.load(P + idx, idx < N * N, other=0)
+    bias = tl.load(Bias + idx, idx < N * N, other=0).to(tl.float32)
+    if UNIT:
+        result = value + bias
+    else:
+        result = value * alpha + bias * beta
+    tl.store(C + idx, result, idx < N * N)
+
+
 def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
     M, K = mat1.shape
     _, N = mat2.shape
@@ -241,6 +289,31 @@ def _launch_addmm(bias, mat1, mat2, out, alpha, beta):
         mat1 = mat1.contiguous()
     if mat2.stride(0) > 1 and mat2.stride(1) > 1:
         mat2 = mat2.contiguous()
+
+    if (
+        M == N == K
+        and (128 <= N < 512 or N == 1024)
+        and N % 128 == 0
+        and mat1.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and mat1.is_contiguous()
+        and mat2.is_contiguous()
+        and bias.shape == out.shape
+        and bias.is_contiguous()
+        and out.is_contiguous()
+    ):
+        partial = torch.empty((M, N), dtype=torch.float32, device=mat1.device)
+        bm = 64 if N < 512 else 256
+        with torch_device_fn.device(mat1.device):
+            _addmm_small_mm[(triton.cdiv(M, bm) * triton.cdiv(N, 128),)](
+                mat1, mat2, partial, N, bm, num_warps=4, num_stages=2
+            )
+            if alpha == 1 and beta == 1:
+                _addmm_small_add[(triton.cdiv(M * N, 8192),)](partial, bias, out, N)
+            else:
+                _addmm_small_finish[(triton.cdiv(M * N, 8192),)](
+                    partial, bias, out, alpha, beta, N, UNIT=False
+                )
+        return out
 
     # Align B row pitch when large NN GEMMs amortize the packing cost.
     # Padding is outside the logical N and is never loaded by the masked kernel.
